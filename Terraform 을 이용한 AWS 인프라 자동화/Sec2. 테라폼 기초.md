@@ -163,7 +163,6 @@ State 파일은 JSON 형식으로 되어 있어 직접 수정하는 것은 권�
 - `terraform state mv <현재_리소스_이름> <새로운_리소스_이름>` : 상태 파일 내에서 리소스의 이름을 변경한다.
 - `terraform state rm <리소스_이름>` : 상태 파일에서 특정 리소스를 제거한다. 실제 리소스는 삭제되지 않는다.
 
-
 --- 
 
 ## Module 를 통한 VPC 생성
@@ -178,19 +177,185 @@ module "vpc" {
 
   name               = "my-vpc"
   cidr               = "10.0.0.0/16"
-  azs                = ["ap-northeast-2a", "ap-northeast-2c"]
-  private_subnets    = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets     = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  azs = ["ap-northeast-2a", "ap-northeast-2c"]
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  public_subnets = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
   enable_nat_gateway = false
   enable_vpn_gateway = false
 
   map_public_ip_on_launch = true
 }
 ```
+
 관례적으로 **vpc.tf** 파일에 vpc 모듈 관련 코드를 정의한다. 모듈을 처음 사용하는 경우에는 `terraform init` 명령어를 통해 모듈을 다운로드해야 한다.
 
-- VPC 의 이름으로 my-vpc 로 지정되며, CIRR 블록으로 10.0.0.0/16 을 사용한다. 
+- VPC 의 이름으로 my-vpc 로 지정되며, CIRR 블록으로 10.0.0.0/16 을 사용한다.
 - 가용 영역은 ap-northeast-2a 와 ap-northeast-2c 두 곳을 사용한다.
 - 퍼블릭 서브넷과 프라이빗 서브넷을 각각 3 개씩 정의한다. (보통 AZ 당 하나씩의 서브넷이 생성되도록 숫자를 맞추는 것을 권장한다.)
 - NAT 게이트웨이와 VPN 게이트웨이는 비활성화한다.
 - 퍼블릭 서브넷에 생성되는 인스턴스에 대해 퍼블릭 IP 주소를 자동으로 할당하도록 설정한다.
+
+---
+
+## Security Group, SSH Key
+
+테라폼 코드를 써서 보안 그룹을 만드는 방식이다. ingress 와 egress 규칙을 통해 인바운드, 아웃바운드 트래픽을 제어할 수 있다.
+
+```terraform
+resource "aws_security_group" "allow_ssh" {
+  name        = "allow_ssh"
+  description = "Allow SSH inbound traffic and all outbound traffic"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    from_port = 22
+    to_port   = 22
+    protocol  = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  egress {
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = {
+    Name = "allow_ssh"
+  }
+}
+```
+
+보안 그룹을 생성한 후, EC2 인스턴스를 생성할 때 해당 보안 그룹을 연결해주어야 한다.
+
+### SSH Key Pair 생성
+
+SSH로 인스턴스에 접속하기 위해서는 키 페어가 필요하다. 로컬 환경에서 별도의 RSA, Ed25519 키 쌍을 생성한 후, 퍼블릭 키를 AWS에 등록하는 방식을 사용할 수 있다.
+AWS 콘솔 상에서는 별도로 키 페어를 생성할 수도 있다.
+
+```terraform
+resource "aws_key_pair" "deployer" {
+  key_name   = "deployer-key"
+  public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIArSxyOkZryj0M6oAhcD2p8KCHeMfSBmlF0YJGbU2uIT secureletter@DESKTOP-M2P7CSN"
+}
+
+```
+
+퍼블릭 키를 등록해주고 개인키를 이용해 인스턴스에 접속할 수 있다.
+
+```terraform
+resource "aws_instance" "example" {
+  ami           = "ami-0b818a04bc9c2133c"
+  instance_type = "t3.micro"
+  subnet_id     = module.vpc.public_subnets[0]
+  vpc_security_group_ids = [aws_security_group.allow_ssh.id]  // 보안 그룹 연결 
+  key_name      = aws_key_pair.deployer.key_name              // SSH 키 페어 연결
+}
+```
+
+### 내장 함수 (Built-in Functions)
+
+테라폼은 다양한 내장 함수를 제공하여 문자열 조작, 수학 연산, 컬렉션 처리 등을 수행할 수 있다.
+테라폼 코드 내에 긴 문자열(SSH 공개 키 등)을 직접 작성하는 대신, 파일에서 읽어오는 함수를 사용할 수 있다.
+
+- `file(path)` : 지정된 경로의 파일 내용을 문자열로 읽어온다.
+- `templatefile(path, vars)` : 지정된 경로의 템플릿 파일을 읽어와 변수들을 치환한 후 문자열로 반환한다.
+
+파일을 읽을 때 경로를 정확하게 지정하기 위해 테라폼의 참조 표현식을 사용한다.
+
+**path.module** 은 현재 작성 중인 테라폼 코드가 위치한 파일 시스템 경로를 지칭한다. 주로 읽기 작업에서 사용이 권장된다.
+
+```terraform
+resource "aws_key_pair" "deployer" {
+  key_name = "deployer-key"
+  public_key = file("../mykey.pub" //  file("${path.module}/../mykey.pub") 과 동일
+    }
+```
+
+--- 
+
+### User Data 를 통한 초기 설정 스크립트
+
+테라폼으로 생성한 인스턴스에 대해 초기 설정 스크립트를 자동으로 실행하도록 할 수 있다. 이를 **프로비저닝(provisioning)** 이라고 한다.
+전통적인 방식은 SSH 접속 후 수동으로 설정하는 것이지만, 테라폼에서는 **user_data** 속성을 통해 초기화 스크립트를 전달할 수 있다.
+
+user_data 는 인스턴스가 최초로 시작될 때 단 한 번 실행되는 스크립트이다.
+이를 이용하면 SSH 키 설정, 네트워크 접근 권한 설정 등 없이 자동으로 초기 설정을 수행할 수 있다.
+
+이는 보안상 유리하며, CI/CD 파이프라인에 적합한 방식이다.
+
+```shell
+#!/bin/bash
+
+apt-get update
+apt-get install -y nginx
+echo "Region: ${region}" > /tmp/region.txt
+```
+
+관례적으로 **templates** 폴더를 만들어 초기화 스크립트를 템플릿 파일로 저장한다.
+
+```terraform
+resource "aws_instance" "example" {
+
+  user_data = templatefile("${path.module}/templates/web.tpl", {
+    region = "ap-northeast-2"
+  })
+
+}
+```
+
+user_data 속성에 templatefile 함수를 사용하여 템플릿 파일을 읽어오고, 필요한 변수를 치환한다.
+
+실행 결과는 aws 인스턴스의 /tmp/region.txt 파일에서 확인할 수 있다.
+
+### 레거시 프로비저너 (Legacy Provisioner)
+
+과거 온프레미스 환경에서 Ansible 등을 연동할 때 많이 사용되었으나, 현재는 클라우드 네이티브 방식에 밀려 사용이 권장되지 않는다.
+이는 테라폼이 생성된 인스턴스에 직접 SSH로 접속하여 명령어를 실행하는 방식이다.
+
+`aws_instance` 리소스에 **provisioner** 블록을 추가하여 사용할 수 있다.'
+
+```terraform
+resource "aws_instance" "example" {
+
+  connection {
+    type = "ssh"
+    user = "ubuntu"
+    private_key = file("mykey")  # 로컬에 있는 개인 키 파일 필요
+    host = self.public_ip # 생성된 인스턴스의 공인 IP
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo apt-get update",
+      "sudo apt-get -y install nginx"
+    ]
+  }
+}
+```
+
+remote-exec 프로비저너는 SSH 접근이 필요하므로 인스턴스의 보안 그룹 설정에서 SSH 접근이 허용되어 있어야 한다.
+또한, 개인 키 파일이 필요하며, 테라폼 상태 파일(State file)이 프로비저닝 성공 여부를 추적한다는 점에서 관리가 번거로울 수 있다.
+
+현대적 흐름은 인스턴스를 직접 설치하기보다 Docker, Kubernetes 을 사용하여 애플리케이션을 배포하는게 추세이다.
+레거시 프로비저너는 사용이 거의 사라져가는 추세이고, user_data 방식은 도커, 쿠버네티스 실행을 위한 Bootstrap 스크립트 실행에 주로 사용된다.
+
+```shell
+# 컨테이너 실행 환경만 구성함
+apt-get install docker
+docker run my-app:v1  # 앱은 도커가 실행
+# 또는 쿠버네티스 클러스터에 합류
+kubeadm join <master-node-ip>
+```
+
+### 테라폼 원격 상태 (Remote State)
+
+기본적으로 테라폼은 terraform.tfstate 파일을 로컬에 저장한다. 그러나, 팀 단위로 협업할 때는 원격 상태 저장소를 사용하는 것이 좋다.
+원격 상태 저장소를 사용하면 여러 사용자가 동시에 작업하더라도 상태 파일이 일관되게 유지된다.
+
+이를 해결하기 위한 방안으로 상태 파일을 AWS S3 같은 원격 저장소에 저장하고 공유하는 것이다.
+
+
